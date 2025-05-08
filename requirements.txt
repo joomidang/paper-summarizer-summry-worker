@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+openai
+pika
+boto3
+python-dotenv
+requests
