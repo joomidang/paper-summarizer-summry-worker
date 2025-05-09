@@ -1,13 +1,16 @@
-import os, time, uuid, json
+import os, time, uuid, json, datetime
 from openai import OpenAI
 from app.config import settings
 
 client = OpenAI(api_key=settings.openai_api_key)
 
 def run_gpt_summarization(instruction_path: str, markdown_text: str, content_list: object,prompt: str = "이 논문을 요약해줘", temperature=0.2) -> str:
+    start_time = time.time()
+    print(f"📋 [{datetime.datetime.now().strftime('%H:%M:%S')}] 논문 요약 시작")
+
     with open(instruction_path, 'r', encoding='utf-8') as f:
         instructions = f.read()
-
+    
     vector_store = client.vector_stores.create(name="Summarizer")
 
     temp_filename = f"/tmp/{uuid.uuid4()}.md"
@@ -55,14 +58,23 @@ def run_gpt_summarization(instruction_path: str, markdown_text: str, content_lis
             3. **즉시 작업 진행**: 모든 지침을 읽고 즉시 요약 작업을 시작하세요. 진행 상황이나 계획에 대한 설명 없이 바로 요약 결과물을 제공해야 합니다.
             """,
         )
+    run_start = time.time()
+    print(f"▶️ [{datetime.datetime.now().strftime('%H:%M:%S')}] 요약 실행 시작")
 
     run = client.beta.threads.runs.create(thread_id=thread.id, assistant_id=assistant.id)
+    dots = 0
     while run.status not in ("completed", "failed", "cancelled"):
+        dots = (dots + 1) % 4
+        print(f"\r⏳ [{datetime.datetime.now().strftime('%H:%M:%S')}] 요약 진행 중: {run.status} {'.'*dots}", end="")
         time.sleep(1)
         run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+    
+    run_time = time.time() - run_start
+    print(f"\n{'✅' if run.status == 'completed' else '❌'} [{datetime.datetime.now().strftime('%H:%M:%S')}] 요약 {run.status} ({run_time:.1f}초)")
 
     if run.status != "completed":
         raise RuntimeError(f"GPT 요약 실패: {run.status}")
+
 
     messages = client.beta.threads.messages.list(thread_id=thread.id)
     summary = ""
@@ -71,11 +83,11 @@ def run_gpt_summarization(instruction_path: str, markdown_text: str, content_lis
             for part in msg.content:
                 if part.type == "text":
                     summary += part.text.value
-                    
-    client.vector_stores.file_batches.delete(vector_store.id)
-    client.vector_stores.files.delete(vector_store.id)
+
     client.vector_stores.delete(vector_store.id)
     client.beta.assistants.delete(assistant.id)
     client.beta.threads.delete(thread.id)
+    total_time = time.time() - start_time
+    print(f"🏁 [{datetime.datetime.now().strftime('%H:%M:%S')}] 논문 요약 완료 | 총 소요시간: {total_time:.1f}초")
 
     return summary

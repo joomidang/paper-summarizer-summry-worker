@@ -20,7 +20,7 @@ def on_message(ch, method, properties, body):
         markdown_text = requests.get(markdown_url).text
         content_list_json = requests.get(content_list_url).json()
         summary = run_gpt_summarization(
-            instruction_path="instructions/p6.md",
+            instruction_path="instructions/p11.md",
             markdown_text=markdown_text,
             content_list=content_list_json,
             prompt=prompt,
