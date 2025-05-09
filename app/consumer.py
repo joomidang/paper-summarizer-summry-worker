@@ -9,17 +9,22 @@ def on_message(ch, method, properties, body):
     payload = msg["payload"]
     paper_id = payload["paperId"]
     markdown_url = payload["markdownUrl"]
+    content_list_url = payload["contentListUrl"]
     prompt = payload.get("prompt") or "test"
+    temperature = payload.get("temperature", 0.2)
     lang = payload.get("language", "ko")
 
     print(f"📥 요약 요청 수신 → paperId={paper_id}")
 
     try:
         markdown_text = requests.get(markdown_url).text
+        content_list_json = requests.get(content_list_url).json()
         summary = run_gpt_summarization(
-            instruction_path="instructions/p5.md",
+            instruction_path="instructions/p11.md",
             markdown_text=markdown_text,
-            prompt=prompt
+            content_list=content_list_json,
+            prompt=prompt,
+            temperature=temperature
         )
         s3_key = upload_markdown(summary, paper_id)
         publish_summary_completed(paper_id, s3_key)
