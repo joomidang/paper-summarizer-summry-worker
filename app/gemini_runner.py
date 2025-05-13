@@ -19,7 +19,7 @@ def run_gpt_summarization(instruction_path: str, markdown_text: str, content_lis
 
         if isinstance(content_list, dict) or isinstance(content_list, list):
             content_list_bytes = json.dumps(content_list, ensure_ascii=False).encode('utf-8')
-            content_mime_type = 'application/json'
+            content_mime_type = 'text/plain'
         elif isinstance(content_list, str):
             content_list_bytes = content_list.encode('utf-8')
             content_mime_type = 'text/plain'
@@ -60,4 +60,4 @@ def run_gpt_summarization(instruction_path: str, markdown_text: str, content_lis
     finally:
         # 총 소요 시간 출력
         total_time = time.time() - start_time
-        print(f"🏁 [{datetime.datetime.now().strftime('%H:%M:%S')}] 논문 요약 완료 총 소요시간: {total_time:.1f}초")
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 논문 요약 완료 총 소요시간: {total_time:.1f}초")

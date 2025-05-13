@@ -32,9 +32,9 @@ def on_message(ch, method, properties, body):
         publish_summary_completed(paper_id, s3_key)
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
-        print(f"✅ 요약 완료 및 업로드 완료 → paperId={paper_id}, s3Key={s3_key}")
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]✅ 요약 완료 및 업로드 완료 → paperId={paper_id}, s3Key={s3_key}")
     except Exception as e:
-        print(f"❌ 처리 실패: {e}")
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]❌ 처리 실패: {e}")
         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
 QUEUE_NAME = "summary.requested.queue"
