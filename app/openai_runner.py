@@ -122,7 +122,7 @@ def run_gpt_summarization(instruction_path: str, markdown_text: str, content_lis
             model="gpt-4.1",
             instructions=instructions,
             tools=[{"type": "file_search"}, {"type": "code_interpreter"}],
-            temperature=temperature,
+            temperature=0.2,
             tool_resources={
                 "file_search": {"vector_store_ids": [vector_store.id]},
                 "code_interpreter": {"file_ids": all_file_ids}
@@ -142,8 +142,8 @@ def run_gpt_summarization(instruction_path: str, markdown_text: str, content_lis
                 2. You have access to the following resources:
                 - Direct files for code interpreter: {main_file.id} and {content_list_file.id}
                 - Vector store ({vector_store.id}) containing the following files:
-                    * Main paper in vector store: {vector_main_file_id or "ID unavailable"}
-                    * Content list in vector store: {vector_content_list_id or "ID unavailable"}
+                    * Main paper in vector store: {vector_main_file_id}
+                    * Content list in vector store: {vector_content_list_id}
                 
                 3. IMPORTANT: When using file_search tool, search in the VECTOR STORE files ({vector_main_file_id or "Main paper"} and {vector_content_list_id or "Content list"}).
                 When using code_interpreter tool, use the direct files ({main_file.id} and {content_list_file.id}).
