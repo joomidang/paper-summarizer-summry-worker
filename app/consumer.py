@@ -1,6 +1,7 @@
-import pika, json, requests, time
+import pika, json, requests, time, datetime
 from app.config import settings
-from app.openai_runner import run_gpt_summarization
+# from app.openai_runner import run_gpt_summarization
+from app.gemini_runner import run_gpt_summarization
 from app.s3 import upload_markdown
 from app.event import publish_summary_completed
 
@@ -14,11 +15,12 @@ def on_message(ch, method, properties, body):
     temperature = payload.get("temperature", 0.2)
     lang = payload.get("language", "ko")
 
-    print(f"📥 요약 요청 수신 → paperId={paper_id}")
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 요약 요청 수신 → paperId={paper_id}")
 
     try:
         markdown_text = requests.get(markdown_url).text
         content_list_json = requests.get(content_list_url).json()
+        
         summary = run_gpt_summarization(
             instruction_path="instructions/p11.md",
             markdown_text=markdown_text,
@@ -56,5 +58,5 @@ def start_consumer():
 
     # 4. consume 시작
     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=on_message, auto_ack=False)
-    print("🟢 MQ Consumer 시작")
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 🟢 MQ Consumer 시작")
     channel.start_consuming()
