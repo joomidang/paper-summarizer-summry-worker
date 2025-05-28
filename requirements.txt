@@ -1,12 +1,7 @@
 fastapi
 uvicorn
-openai
 google-genai
 pika
 boto3
 python-dotenv
 requests
-uuid
-time
-datetime
-json

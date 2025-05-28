@@ -12,7 +12,7 @@ def on_message(ch, method, properties, body):
     markdown_url = payload["markdownUrl"]
     content_list_url = payload["contentListUrl"]
     prompt = payload.get("prompt") or "test"
-    temperature = payload.get("temperature", 0.2)
+    temperature = payload.get("temperature", 0.1)
     lang = payload.get("language", "ko")
 
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 요약 요청 수신 → paperId={paper_id}")
@@ -22,7 +22,7 @@ def on_message(ch, method, properties, body):
         content_list_json = requests.get(content_list_url).json()
         
         summary = run_gpt_summarization(
-            instruction_path="instructions/p11.md",
+            instruction_path="instructions/instructions.md",
             markdown_text=markdown_text,
             content_list=content_list_json,
             prompt=prompt,
@@ -44,7 +44,27 @@ ROUTING_KEY = "SUMMARY_REQUESTED"
 def start_consumer():
     print("MQ 연결 대기중...")
     time.sleep(10)
-    conn = pika.BlockingConnection(pika.URLParameters(settings.rabbitmq_url))
+    
+    # URL 파라미터에서 연결 파라미터로 변경하여 heartbeat 설정
+    from urllib.parse import urlparse
+    parsed_url = urlparse(settings.rabbitmq_url)
+    
+    connection_params = pika.ConnectionParameters(
+        host=parsed_url.hostname,
+        port=parsed_url.port or 5672,
+        virtual_host=parsed_url.path.lstrip('/') or '/',
+        credentials=pika.PlainCredentials(
+            parsed_url.username or 'guest',
+            parsed_url.password or 'guest'
+        ),
+        heartbeat=240,  # 3분
+        blocked_connection_timeout=200,  # 3분
+        connection_attempts=3,
+        retry_delay=5.0
+    )
+    
+    # 이 부분이 핵심 - connection_params를 실제로 사용
+    conn = pika.BlockingConnection(connection_params)
     channel = conn.channel()
 
     # 1. exchange 선언 (direct 타입)

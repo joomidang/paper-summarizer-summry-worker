@@ -1,234 +1,869 @@
 import os
+import tempfile
 import json
 import time
-import sys
-import argparse
-from openai import OpenAI
-import tiktoken
-from dotenv import load_dotenv
+import logging
+import asyncio
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+from uuid import uuid4
 
-def main(args):
-    # 환경 변수 로드
-    load_dotenv()
+import boto3
+import uvicorn
+import httpx
+from pydantic import BaseModel, Field
+from fastapi import FastAPI, Body, Header, HTTPException, Depends, BackgroundTasks, status
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pyngrok import ngrok
+from functools import wraps
 
-    target_filename = args.file
-    content_list_filename = args.file.replace('.md', '_content_list.json')
-    instruction_filename = args.instruction
-    temperature = args.temperature
+# MagicPDF imports
+from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
+from magic_pdf.data.dataset import PymuDocDataset
+from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
+from magic_pdf.tools import counter_manager
 
-    # OpenAI 클라이언트 초기화
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("app.log")
+    ]
+)
+logger = logging.getLogger("magic-pdf-service")
+
+# Configuration
+class Config:
+    # S3 configuration
+    INPUT_BUCKET = os.getenv("INPUT_BUCKET", "paper-dev-test-magic-pdf-input")
+    OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "paper-dev-test-magic-pdf-output")
+    INPUT_PREFIX = os.getenv("INPUT_PREFIX", "")
+    OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "")
     
-    # 파일 ID를 저장할 리스트
-    all_file_ids = []
+    # AWS credentials
+    AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
+    AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
+    AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+    
+    # API endpoints
+    API_SERVER_URL = os.getenv("API_SERVER_URL", "http://43.202.9.100:8080/api/papers/{paper_id}/callback")
+    
+    # App settings
+    DEBUG = os.getenv("DEBUG", "False").lower() == "true"
+    USE_NGROK = os.getenv("USE_NGROK", "False").lower() == "true"
+    HOST = os.getenv("HOST", "0.0.0.0")
+    PORT = int(os.getenv("PORT", "8000"))
 
-    try:
-    # instruction 파일 읽기
-        with open(instruction_filename, "r", encoding="utf-8") as f:
-            instructions = f.read()
+config = Config()
 
-        print("파일 업로드 중...")
-        # 메인 논문 파일 업로드 (어시스턴트용)
-        main_file = client.files.create(
-            file=open(target_filename, "rb"),
-            purpose="assistants")
-        all_file_ids.append(main_file.id)
-        print(f"메인 파일 업로드 완료 (어시스턴트용): {main_file.id}")
-        
-        # content_list 파일 업로드 (어시스턴트용)
-        content_list_file = client.files.create(
-            file=open(content_list_filename, "rb"),
-            purpose="assistants")
-        all_file_ids.append(content_list_file.id)
-        print(f"콘텐츠 리스트 파일 업로드 완료 (어시스턴트용): {content_list_file.id}")
-        
-        print("벡터 스토어 생성 중...")
-        file_paths = [target_filename, content_list_filename]
-        file_streams = [open(path, "rb") for path in file_paths]
+# Models
+class User(BaseModel):
+    userId: int
+    username: str
 
-        vector_store = client.vector_stores.create(name="Summarizer")
+class ParseRequest(BaseModel):
+    paperId: int
+    userId: int
+    s3Url: str
 
-        file_batch = client.vector_stores.file_batches.upload_and_poll(
-            vector_store_id=vector_store.id, files=file_streams
-        )
-        print(f"벡터 스토어 생성 완료: {vector_store.id}")
-        print(f"파일 배치 상태: {file_batch.file_counts}")
+class Response(BaseModel):
+    code: str
+    message: str
+    data: Optional[Dict[str, Any]] = None
+
+class CancelRequest(BaseModel):
+    paperId: int
+
+class JobStatus:
+    """Job status tracker with persistent storage option"""
+    
+    def __init__(self):
+        self.statuses = {}
+        self.tokens = {}
+        # Cleanup old jobs periodically
+        self.cleanup_interval = timedelta(hours=24)
+        self.max_age = timedelta(days=7)
+    
+    def create_job(self, paper_id: int, user_id: int) -> str:
+        """Create a new job and return the job ID"""
+        job_id = f"pdf-job-{paper_id}-{int(time.time())}"
+        self.statuses[job_id] = {
+            "status": "queued",
+            "message": "Job queued, waiting to start",
+            "paperId": paper_id,
+            "userId": user_id,
+            "created_at": datetime.now().isoformat()
+        }
+        return job_id
+    
+    def update_job(self, job_id: str, **kwargs) -> None:
+        """Update job status with the provided fields"""
+        if job_id in self.statuses:
+            self.statuses[job_id].update(kwargs)
+            self.statuses[job_id]["updated_at"] = datetime.now().isoformat()
+    
+    def get_job_by_paper_id(self, paper_id: int) -> Optional[Dict[str, Any]]:
+        """Find a job by paper ID"""
+        for job_id, status in self.statuses.items():
+            if status.get("paperId") == paper_id:
+                return {"job_id": job_id, **status}
+        return None
+    
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Get job status by job ID"""
+        return self.statuses.get(job_id)
+    
+    def get_job_status(self, job_id: str) -> Optional[str]:
+        """Safely get job status"""
+        job = self.get_job(job_id)
+        return job.get("status") if job else None
+    
+    def store_token(self, job_id: str, token: str) -> None:
+        """Store authentication token for a job"""
+        self.tokens[job_id] = token
+    
+    def get_token(self, job_id: str) -> Optional[str]:
+        """Get authentication token for a job"""
+        return self.tokens.get(job_id)
+    
+    async def cleanup_old_jobs(self):
+        """Remove old jobs from memory to prevent memory leaks"""
+        now = datetime.now()
+        to_remove = []
         
-        # 파일 ID 매핑 정보 생성
-        vector_file_ids = []
-        vector_main_file_id = None
-        vector_content_list_id = None
+        for job_id, status in self.statuses.items():
+            created_at = datetime.fromisoformat(status.get("created_at", now.isoformat()))
+            if now - created_at > self.max_age:
+                to_remove.append(job_id)
         
-        # 벡터 스토어 파일 ID 명확하게 추출
-        try:
-            # 방법 1: 벡터 스토어의 파일 목록 직접 조회
-            vs_files = client.vector_stores.files.list(vector_store_id=vector_store.id).data
-            print(f"벡터 스토어 파일 목록 조회 성공 (파일 수: {len(vs_files)})")
+        for job_id in to_remove:
+            self.statuses.pop(job_id, None)
+            self.tokens.pop(job_id, None)
             
-            for i, vs_file in enumerate(vs_files):
-                vector_file_ids.append(vs_file.id)
-                all_file_ids.append(vs_file.id)
-                print(f"벡터 스토어 파일 #{i+1}: {vs_file.id}")
-                
-                # 첫 번째 파일이 main_file, 두 번째가 content_list_file에 해당
-                if i == 0:
-                    vector_main_file_id = vs_file.id
-                    print(f"벡터 스토어 메인 파일 ID: {vector_main_file_id}")
-                elif i == 1:
-                    vector_content_list_id = vs_file.id
-                    print(f"벡터 스토어 콘텐츠 리스트 ID: {vector_content_list_id}")
+        logger.info(f"Cleaned up {len(to_remove)} old jobs from memory")
+    
+    def save_to_file(self, filename="job_statuses.json"):
+        """Save job statuses to a file for persistence"""
+        with open(filename, "w") as f:
+            json.dump({
+                "statuses": self.statuses,
+                # Don't save tokens to file for security
+            }, f)
+    
+    def load_from_file(self, filename="job_statuses.json"):
+        """Load job statuses from a file"""
+        try:
+            if os.path.exists(filename):
+                with open(filename, "r") as f:
+                    data = json.load(f)
+                    self.statuses = data.get("statuses", {})
+                    logger.info(f"Loaded {len(self.statuses)} jobs from file")
         except Exception as e:
-            print(f"벡터 스토어 파일 ID 추출 중 오류: {e}")
-            # 오류 발생 시 기본 파일 ID 사용
-            vector_main_file_id = main_file.id
-            vector_content_list_id = content_list_file.id
+            logger.error(f"Error loading job statuses from file: {str(e)}")
 
-        # Assistant 생성 - 모든 파일 ID 전달
-        print("Assistant 생성 중...")
-        assistant = client.beta.assistants.create(
-            name="PaperSummarizer",
-            model="gpt-4.1",
-            tools=[{"type": "code_interpreter"}, {"type": "file_search"}],
-            instructions=instructions,
-            temperature=temperature,
-            tool_resources={
-                "code_interpreter": {"file_ids": all_file_ids},
-                "file_search": {"vector_store_ids": [vector_store.id]}
-            },
-            response_format={"type": "text"},
-        )
-        print(f"Assistant 생성 완료: {assistant.id}")
 
-        print("Thread 생성 중...")
-        thread = client.beta.threads.create(
-            messages=[{
-                "role": "user",
-                "content": f"""
-                1. Please read and comprehend all instructions carefully, paying close attention to the specified guidelines for academic paper summarization.
-                
-                2. You have access to the following resources:
-                - Direct files for code interpreter: {main_file.id} and {content_list_file.id}
-                - Vector store ({vector_store.id}) containing the following files:
-                    * Main paper in vector store: {vector_main_file_id or "ID unavailable"}
-                    * Content list in vector store: {vector_content_list_id or "ID unavailable"}
-                
-                3. IMPORTANT: When using file_search tool, search in the VECTOR STORE files ({vector_main_file_id or "Main paper"} and {vector_content_list_id or "Content list"}).
-                When using code_interpreter tool, use the direct files ({main_file.id} and {content_list_file.id}).
-                
-                4. **Immediate Action Required**: After reading all instructions, begin the summarization process immediately. Provide the summary without any explanations or discussions about the progress or plans.
-                """,
-                "attachments": [
-                    {"file_id": main_file.id, "tools": [{"type": "file_search"}, {"type": "code_interpreter"}]}
-                ],
-            }]
-        )
-        print(f"Thread 생성 완료: {thread.id}")
+# Initialize job status tracker
+job_tracker = JobStatus()
 
-        print("요약 실행 중...")
-        # run = client.beta.threads.runs.create_and_poll(
-        #     thread_id=thread.id, assistant_id=assistant.id
-        # )
+# S3 client
+def get_s3_client():
+    """Get a configured S3 client"""
+    if not config.AWS_ACCESS_KEY or not config.AWS_SECRET_KEY:
+        logger.warning("AWS credentials not found in environment variables")
+        
+    return boto3.client(
+        's3',
+        aws_access_key_id=config.AWS_ACCESS_KEY,
+        aws_secret_access_key=config.AWS_SECRET_KEY,
+        region_name=config.AWS_REGION
+    )
 
-        run = client.beta.threads.runs.create(
-            thread_id=thread.id, 
-            assistant_id=assistant.id,
-            # additional_instructions=instructions,
-            temperature=temperature,
-        )
-        while run.status not in ("completed", "failed", "cancelled"):
-            time.sleep(1)
-            run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-            print(f"Run status: {run.status}")
-
-        if run.status == "completed":
-            print("요약 작업 완료!")
-        else:
-            print(f"요약 작업 실패: {run.status}")
-            exit(1)
-
-        print("응답 저장 중...")
-        messages = client.beta.threads.messages.list(thread_id=thread.id)
-        for msg in messages.data:
-            if msg.role == "assistant":
-                summary = ""
-                for content_part in msg.content:
-                    if content_part.type == "text":
-                        summary += content_part.text.value
-
-                def get_unique_filename(base_path):
-                    if not os.path.exists(base_path):
-                        return base_path
-                    base_name, ext = os.path.splitext(base_path)
-                    count = 1
-                    while True:
-                        new_path = f"{base_name}_{count}{ext}"
-                        if not os.path.exists(new_path):
-                            return new_path
-                        count += 1
-
-                output_file = f"output/{instruction_filename}_논문_요약.md"
-                os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                output_file = get_unique_filename(output_file)
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    f.write(summary)
-                print(f"요약이 완료되었습니다. '{output_file}' 파일을 확인하세요.")
-                break
-    finally:
-        # 리소스 정리 부분도 수정
-        print("리소스 정리 중...")
+# S3 operations
+class S3Operations:
+    @staticmethod
+    def parse_s3_url(s3_url: str) -> tuple:
+        """Parse S3 URL to extract bucket and key"""
         try:
-            # 벡터 스토어가 있으면 먼저 삭제
-            if 'vector_store' in locals():
-                client.vector_stores.delete(vector_store.id)
-                print(f"Vector Store 삭제 완료: {vector_store.id}")
-                # 삭제 후 벡터 스토어 확인
-                time.sleep(2)
-                remaining = client.vector_stores.list().data
-                if remaining:
-                    print(f"경고: {len(remaining)}개의 벡터 스토어가 남아있습니다")
-                    for rem_vs in remaining:
-                        try:
-                            client.vector_stores.delete(vector_store_id=rem_vs.id)
-                            print(f"남은 벡터 스토어 삭제 완료: {rem_vs.id}")
-                        except Exception as e:
-                            print(f"남은 벡터 스토어 삭제 중 오류: {e}")
-            
-            # 모든 파일 ID 삭제
-            for file_id in all_file_ids:
-                try:
-                    client.files.delete(file_id)
-                    print(f"파일 삭제 완료: {file_id}")
-                except Exception as e:
-                    print(f"파일 삭제 중 오류: {e}")
-            
-            # 나머지 리소스 삭제
-            if 'thread' in locals():
-                client.beta.threads.delete(thread.id)
-                print(f"Thread 삭제 완료: {thread.id}")
+            if "amazonaws.com" in s3_url:
+                url_without_protocol = s3_url.replace("https://", "").replace("http://", "")
+                parts = url_without_protocol.split("/")
                 
-            if 'assistant' in locals():
-                client.beta.assistants.delete(assistant.id)
-                print(f"Assistant 삭제 완료: {assistant.id}")
+                # Extract bucket from domain
+                bucket_and_region = parts[0]  # e.g., "bucket-name.s3.region.amazonaws.com"
+                bucket = bucket_and_region.split(".")[0]  # e.g., "bucket-name"
                 
-            # 마지막으로 남은 파일들 삭제
+                # Key is everything after the domain
+                key = "/".join(parts[1:])
+            else:
+                bucket = config.INPUT_BUCKET
+                key = s3_url if not s3_url.startswith("/") else s3_url[1:]
+            
+            return bucket, key
+        except Exception as e:
+            logger.error(f"Error parsing S3 URL '{s3_url}': {str(e)}")
+            raise ValueError(f"Invalid S3 URL format: {s3_url}")
+    
+    @staticmethod
+    async def download_file(s3_url: str, local_path: str) -> tuple:
+        """Download a file from S3 to local path"""
+        s3_client = get_s3_client()
+        
+        try:
+            # Parse S3 URL
+            bucket, key = S3Operations.parse_s3_url(s3_url)
+            
+            # Run blocking S3 operations in a thread pool
+            loop = asyncio.get_running_loop()
+            
+            # Check if file exists
+            await loop.run_in_executor(
+                None, 
+                lambda: s3_client.head_object(Bucket=bucket, Key=key)
+            )
+            
+            # Download file
+            logger.info(f"Downloading: bucket={bucket}, key={key}, local_path={local_path}")
+            await loop.run_in_executor(
+                None,
+                lambda: s3_client.download_file(bucket, key, local_path)
+            )
+            
+            return True, None
+        except Exception as e:
+            error_msg = f"S3 download error: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg
+    
+    @staticmethod
+    async def upload_files(local_dir: str, paper_id: int) -> dict:
+        """Upload all files in a directory to S3 bucket"""
+        s3_client = get_s3_client()
+        
+        s3_urls = {
+            "markdown": "",
+            "contentList": "",
+            "figures": [],
+            "tables": []
+        }
+        
+        try:
+            loop = asyncio.get_running_loop()
+            upload_tasks = []
+            
+            for root, _, files in os.walk(local_dir):
+                for file in files:
+                    if file.endswith(".pdf"):
+                        continue
+                    
+                    local_file_path = os.path.join(root, file)
+                    relative_path = os.path.relpath(local_file_path, local_dir).replace('\\', '/')
+                    
+                    s3_key = f"{config.OUTPUT_PREFIX}papers/{paper_id}/{relative_path}"
+                    
+                    # Queue upload task
+                    upload_tasks.append(loop.run_in_executor(
+                        None,
+                        lambda local_path=local_file_path, bucket=config.OUTPUT_BUCKET, key=s3_key: 
+                            s3_client.upload_file(local_path, bucket, key)
+                    ))
+                    
+                    # Categorize the file for URL generation
+                    s3_url = f"https://{config.OUTPUT_BUCKET}.s3.amazonaws.com/papers/{paper_id}/{relative_path}"
+                    
+                    if file.endswith(".md"):
+                        s3_urls["markdown"] = s3_url
+                    elif file.endswith("_content_list.json"):
+                        s3_urls["contentList"] = s3_url
+                    elif "figure" in file and file.endswith((".jpg", ".png")):
+                        s3_urls["figures"].append(s3_url)
+                    elif "table" in file and file.endswith((".jpg", ".png")):
+                        s3_urls["tables"].append(s3_url)
+            
+            # Execute all uploads in parallel
+            if upload_tasks:
+                await asyncio.gather(*upload_tasks)
+                logger.info(f"Successfully uploaded {len(upload_tasks)} files to S3 for paper {paper_id}")
+            
+            return s3_urls
+        except Exception as e:
+            logger.error(f"Error uploading files to S3: {str(e)}")
+            raise
+
+# PDF Processing
+class PDFProcessor:
+    @staticmethod
+    async def process_pdf(pdf_path: str, output_dir: str, name: str, job_id: str = None) -> dict:
+        """Process a PDF file using MagicPDF"""
+        
+        def check_cancellation():
+            """Check if the job has been cancelled"""
+            if job_id:
+                job = job_tracker.get_job(job_id)
+                if job and job.get("status") == "canceled":
+                    logger.info(f"Job cancellation detected: {job_id}")
+                    return True
+            return False
+        
+        try:
+            # Initialize directories
+            local_image_dir = os.path.join(output_dir, "images")
+            local_md_dir = output_dir
+            image_dir = "images"
+            
+            counter_manager.reset_counters()
+            os.makedirs(local_image_dir, exist_ok=True)
+            
+            # Initialize readers/writers
+            image_writer = FileBasedDataWriter(local_image_dir)
+            md_writer = FileBasedDataWriter(local_md_dir)
+            reader = FileBasedDataReader("")
+            pdf_bytes = reader.read(pdf_path)
+            
+            # Process PDF
+            if check_cancellation():
+                return {"status": "canceled"}
+                
+            ds = PymuDocDataset(pdf_bytes)
+            
+            # Use OCR mode for all documents for consistency
+            if check_cancellation():
+                return {"status": "canceled"}
+                
+            infer_result = ds.apply(doc_analyze, ocr=True)
+            pipe_result = infer_result.pipe_ocr_mode(image_writer)
+            
+            # Get model inference result
+            if check_cancellation():
+                return {"status": "canceled"}
+                
+            # Update with model inference result
+            results = {"model_inference": "Generated"}
+            
+            # Generate and write markdown
+            if check_cancellation():
+                return {"status": "canceled"}
+                
+            md_content = pipe_result.get_markdown(image_dir)
+            md_path = f"{name}.md"
+            
+            if check_cancellation():
+                return {"status": "canceled"}
+                
+            pipe_result.dump_md(md_writer, md_path, image_dir)
+            results["markdown"] = md_path
+            
+            # Generate and write content list
+            if check_cancellation():
+                return {"status": "canceled"}
+                
+            content_list_content = pipe_result.get_content_list(image_dir)
+            content_list_path = f"{name}_content_list.json"
+            
+            if check_cancellation():
+                return {"status": "canceled"}
+                
+            pipe_result.dump_content_list(md_writer, content_list_path, image_dir)
+            results["content_list"] = content_list_path
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error processing PDF: {str(e)}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "message": "Error occurred during PDF processing"
+            }
+    
+    @staticmethod
+    async def extract_title_from_markdown(markdown_path: str, paper_id: int = None) -> str:
+        """Extract title from markdown and update image paths"""
+        try:
+            with open(markdown_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                lines = content.split('\n')
+                
+                # Extract title from first line
+                extracted_title = lines[0].strip() if lines else ""
+                
+                # Update image paths if paper_id is provided
+                if paper_id is not None:
+                    s3_base_url = f"https://{config.OUTPUT_BUCKET}.s3.ap-northeast-2.amazonaws.com/papers/{paper_id}"
+                    import re
+                    
+                    # Convert markdown image links to HTML img tags with S3 URLs
+                    updated_content = re.sub(
+                        r'!\[(.*?)\]\(images/(.*?)\)',
+                        rf'<img src="{s3_base_url}/images/\2"/>\n',
+                        content
+                    )
+                    
+                    # Write updated content back to markdown file
+                    with open(markdown_path, 'w', encoding='utf-8') as fw:
+                        fw.write(updated_content)
+                    
+                    logger.info(f"Markdown image paths updated to S3 URLs: {paper_id}")
+            
+            return extracted_title
+            
+        except Exception as e:
+            logger.error(f"Error processing markdown: {str(e)}")
+            return ""
+    
+    @staticmethod
+    async def filter_content_list(json_file_path: str, output_file_path: str = None, paper_id: int = None) -> list:
+        """Filter out text and equation items from content list"""
+        try:
+            # Load JSON file
+            with open(json_file_path, 'r', encoding='utf-8') as file:
+                data = json.load(file)
+            
+            # Filter items
+            filtered_items = [item for item in data if item.get("type") not in ["text", "equation"]]
+            
+            # Update image paths if paper_id is provided
+            if paper_id is not None:
+                s3_base_url = f"https://{config.OUTPUT_BUCKET}.s3.ap-northeast-2.amazonaws.com/papers/{paper_id}"
+                
+                for item in filtered_items:
+                    if 'img_path' in item and item['img_path'].startswith('images/'):
+                        item['img_path'] = f"{s3_base_url}/{item['img_path']}"
+            
+            # Write filtered items to output file if specified
+            if output_file_path:
+                with open(output_file_path, 'w', encoding='utf-8') as out_file:
+                    json.dump(filtered_items, out_file, indent=4, ensure_ascii=False)
+            
+            return filtered_items
+            
+        except Exception as e:
+            logger.error(f"Error processing content list: {str(e)}")
+            return None
+
+# API callbacks
+class APIClient:
+    @staticmethod
+    async def send_result(user_id: int, paper_id: int, s3_urls: dict, paper_title: str, job_id: str = None) -> dict:
+        """Send parsing results to API server"""
+        
+        # Prepare API endpoint URL
+        api_url = config.API_SERVER_URL.format(paper_id=paper_id)
+        
+        # Prepare request payload
+        payload = {
+            "title": paper_title,
+            "markdownUrl": s3_urls.get("markdown", ""),
+            "contentListUrl": s3_urls.get("contentList", ""),
+            "figures": s3_urls.get("figures", []),
+            "tables": s3_urls.get("tables", [])
+        }
+        
+        # Prepare headers
+        headers = {"Content-Type": "application/json"}
+        
+        # Add authorization token if available
+        if job_id:
+            token = job_tracker.get_token(job_id)
+            if token:
+                headers["Authorization"] = token
+                logger.info(f"Including token for job: {job_id}")
+            else:
+                logger.info(f"No token available for job: {job_id}")
+        
+        # Log request details
+        logger.info(f"API request URL: {api_url}")
+        logger.info(f"API request headers: {json.dumps({k: '***' if k == 'Authorization' else v for k, v in headers.items()})}")
+        logger.info(f"API request payload: {json.dumps(payload, ensure_ascii=False)}")
+        
+        try:
+            # Use httpx for async HTTP requests (instead of requests)
+            async with httpx.AsyncClient(timeout=30, verify=False) as client:
+                response = await client.post(
+                    api_url,
+                    json=payload,
+                    headers=headers
+                )
+            
+            # Process response
+            logger.info(f"API response status: {response.status_code}")
+            
             try:
-                remaining_files = client.files.list().data
-                for remaining_file in remaining_files:
-                    if remaining_file.id not in all_file_ids:  # 중복 삭제 방지
-                        client.files.delete(remaining_file.id)
-                        print(f"남은 파일 삭제 완료: {remaining_file.id}")
-            except Exception as e:
-                print(f"남은 파일 삭제 중 오류: {e}")
-
-            print("모든 리소스가 정리되었습니다.")
+                response_json = response.json()
+                logger.info(f"API response content: {json.dumps(response_json, ensure_ascii=False)}")
+            except:
+                response_json = {"raw": response.text}
+                logger.warning(f"Failed to parse API response as JSON: {response.text}")
+            
+            result = {
+                "status": "success" if response.status_code < 400 else "error",
+                "status_code": response.status_code,
+                "response": response_json
+            }
+            
+            return result
+            
+        except httpx.ConnectError:
+            logger.error("Connection error: Unable to connect to API server")
+            return {
+                "status": "error",
+                "message": "Unable to connect to API server"
+            }
+        except httpx.TimeoutException:
+            logger.error("Timeout: API server response timeout")
+            return {
+                "status": "error",
+                "message": "API server response timeout"
+            }
         except Exception as e:
-            print(f"리소스 정리 중 오류 발생: {str(e)}")
+            logger.error(f"API request error: {str(e)}")
+            return {
+                "status": "error",
+                "message": str(e)
+            }
 
+# Main processing workflow
+async def process_pdf_workflow(job_id: str, request: ParseRequest) -> None:
+    """Main workflow for PDF processing"""
+    paper_id = request.paperId
+    user_id = request.userId
+    s3_url = request.s3Url
+    
+    # Check for cancellation
+    job = job_tracker.get_job(job_id)
+    if job and job.get("status") == "canceled":
+        logger.info(f"Job {job_id} was canceled before processing")
+        return
+    
+    # Update job status
+    job_tracker.update_job(job_id, status="running", message="Processing started")
+    
+    try:
+        # Create temporary directory for processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                name_without_suffix = f"paper_{paper_id}"
+                filename = s3_url.split("/")[-1]
+                local_pdf_path = os.path.join(temp_dir, filename)
+                
+                # Step 1: Download PDF from S3
+                job_status = job_tracker.get_job_status(job_id)
+                if job_status == "canceled":
+                    logger.info(f"Job {job_id} was canceled before download")
+                    return
+                    
+                success, error_msg = await S3Operations.download_file(s3_url, local_pdf_path)
+                if not success:
+                    job_tracker.update_job(
+                        job_id, 
+                        status="failed", 
+                        message=error_msg
+                    )
+                    logger.error(f"S3 download failed: {error_msg}")
+                    return
+                
+                # Step 2: Process PDF
+                job_status = job_tracker.get_job_status(job_id)
+                if job_status == "canceled":
+                    logger.info(f"Job {job_id} was canceled before processing")
+                    return
+                    
+                results = await PDFProcessor.process_pdf(local_pdf_path, temp_dir, name_without_suffix, job_id)
+                
+                # Handle processing results
+                if isinstance(results, dict):
+                    if results.get("status") == "canceled":
+                        job_tracker.update_job(
+                            job_id,
+                            status="canceled",
+                            message="User requested cancellation during processing"
+                        )
+                        return
+                    elif results.get("status") == "error":
+                        job_tracker.update_job(
+                            job_id,
+                            status="failed",
+                            message=results.get("message", "Error during PDF processing"),
+                            error=results.get("error", "Unknown error")
+                        )
+                        return
+                
+                # Step 3: Process content list
+                content_list_path = os.path.join(temp_dir, f"{name_without_suffix}_content_list.json")
+                if os.path.exists(content_list_path):
+                    logger.info("Filtering text and equation items from content list")
+                    await PDFProcessor.filter_content_list(content_list_path, content_list_path, paper_id)
+                
+                # Step 4: Extract title and update image paths
+                markdown_file_path = os.path.join(temp_dir, f"{name_without_suffix}.md")
+                extracted_title = ""
+                if os.path.exists(markdown_file_path):
+                    extracted_title = await PDFProcessor.extract_title_from_markdown(markdown_file_path, paper_id)
+                
+                # Step 5: Upload results to S3
+                job_status = job_tracker.get_job_status(job_id)
+                if job_status == "canceled":
+                    logger.info(f"Job {job_id} was canceled before upload")
+                    return
+                    
+                s3_urls = await S3Operations.upload_files(temp_dir, paper_id)
+                
+                # Step 6: Send results to API server
+                job_status = job_tracker.get_job_status(job_id)
+                if job_status == "canceled":
+                    logger.info(f"Job {job_id} was canceled after upload")
+                    return
+                    
+                api_response = await APIClient.send_result(user_id, paper_id, s3_urls, extracted_title, job_id)
+                
+                # Update job status with results
+                job_tracker.update_job(
+                    job_id,
+                    status="completed",
+                    message="Processing completed successfully",
+                    results=s3_urls,
+                    title=extracted_title,
+                    api_callback_status=api_response
+                )
+            except Exception as e:
+                logger.error(f"Error processing in temp directory: {str(e)}")
+                raise
+    except Exception as e:
+        logger.error(f"Error in PDF processing workflow for job {job_id}, paper {paper_id}: {str(e)}")
+        job_tracker.update_job(
+            job_id,
+            status="failed",
+            message=f"Error: {str(e)}"
+        )
+
+# Initialize FastAPI app
+app = FastAPI(title="MagicPDF Processing Service")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Background task for periodic job cleanup
+@app.on_event("startup")
+async def setup_periodic_tasks():
+    """Set up periodic tasks to run on application startup"""
+    # Load saved job statuses if available
+    job_tracker.load_from_file()
+    
+    # Start periodic cleanup task
+    asyncio.create_task(periodic_cleanup())
+
+async def periodic_cleanup():
+    """Periodically clean up old jobs to prevent memory leaks"""
+    while True:
+        try:
+            await job_tracker.cleanup_old_jobs()
+            job_tracker.save_to_file()
+            await asyncio.sleep(3600)  # Run cleanup every hour
+        except Exception as e:
+            logger.error(f"Error in periodic cleanup: {str(e)}")
+            await asyncio.sleep(300)  # If error, retry after 5 minutes
+
+@app.on_event("shutdown")
+async def save_state():
+    """Save state before shutting down"""
+    job_tracker.save_to_file()
+    logger.info("Saved job statuses to file before shutdown")
+
+# API endpoints
+@app.post("/api/parse", response_model=Response, status_code=status.HTTP_202_ACCEPTED)
+async def parse_paper(
+    request: ParseRequest = Body(...),
+    authorization: str = Header(None),
+    background_tasks: BackgroundTasks = Depends()
+):
+    """
+    Parse a PDF paper and extract content
+    
+    - **paperId**: ID of the paper
+    - **userId**: ID of the user requesting the parsing
+    - **s3Url**: S3 URL of the PDF file
+    """
+    # Generate job ID
+    job_id = job_tracker.create_job(request.paperId, request.userId)
+    paper_id = request.paperId
+    user_id = request.userId
+    
+    # Log request details
+    logger.info(f"Parsing request received: Paper ID={paper_id}, User ID={user_id}, S3 URL={request.s3Url}")
+    
+    # Store authorization token
+    if authorization:
+        auth_prefix = authorization[:10] if len(authorization) > 10 else authorization
+        masked_auth = f"{auth_prefix}...{len(authorization)-15}chars" if len(authorization) > 15 else "[token]"
+        job_tracker.store_token(job_id, authorization)
+        logger.info(f"Authorization header received: {masked_auth}")
+    else:
+        logger.info("No Authorization header received")
+    
+    try:
+        # Add processing task to background
+        background_tasks.add_task(process_pdf_workflow, job_id, request)
+        
+        return Response(
+            code="SUCCESS_OK",
+            message="Parsing request successfully processed",
+            data={
+                "paperId": paper_id,
+                "userId": user_id,
+                "jobId": job_id,
+                "status": "QUEUED"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error processing parsing request: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=Response(
+                code="SERVER_ERROR",
+                message="Server error occurred",
+                data={"error": str(e)}
+            ).dict()
+        )
+
+@app.post("/api/parse/cancel", response_model=Response)
+async def cancel_parsing(request: CancelRequest = Body(...)):
+    """
+    Cancel a parsing job
+    
+    - **paperId**: ID of the paper whose parsing job should be canceled
+    """
+    paper_id = request.paperId
+    
+    # Find job by paper ID
+    job = job_tracker.get_job_by_paper_id(paper_id)
+    
+    if not job:
+        logger.warning(f"No parsing job found for paper ID: {paper_id}")
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=Response(
+                code="NOT_FOUND",
+                message="No parsing job found for the specified paper",
+                data=None
+            ).dict()
+        )
+    
+    job_id = job.get("job_id")
+    current_status = job.get("status")
+    
+    # Check if job can be canceled
+    if current_status == "completed":
+        logger.warning(f"Cannot cancel completed job for paper ID: {paper_id}")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=Response(
+                code="ALREADY_COMPLETED",
+                message="Cannot cancel a job that has already completed",
+                data=None
+            ).dict()
+        )
+    
+    if current_status == "failed":
+        logger.warning(f"Cannot cancel failed job for paper ID: {paper_id}")
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=Response(
+                code="ALREADY_FAILED",
+                message="Cannot cancel a job that has already failed",
+                data=None
+            ).dict()
+        )
+    
+    # Cancel the job
+    job_tracker.update_job(
+        job_id,
+        status="canceled",
+        message="User requested cancellation"
+    )
+    
+    logger.info(f"Cancellation request received for job: {job_id}")
+    return Response(
+        code="SUCCESS_OK",
+        message="Cancellation request received",
+        data={
+            "paperId": paper_id,
+            "jobId": job_id
+        }
+    )
+
+@app.get("/api/status/{paper_id}", response_model=Response)
+async def get_paper_status(paper_id: int):
+    """
+    Get the status of a paper parsing job
+    
+    - **paper_id**: ID of the paper
+    """
+    # Find job by paper ID
+    job = job_tracker.get_job_by_paper_id(paper_id)
+    
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, 
+            detail="Paper job not found"
+        )
+    
+    return Response(
+        code="SUCCESS_OK",
+        message="Paper processing status retrieved successfully",
+        data={
+            "paperId": paper_id,
+            "status": job.get("status"),
+            "message": job.get("message"),
+            "results": job.get("results") if job.get("status") == "completed" else None
+        }
+    )
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy", 
+        "version": "1.0.0",
+        "active_jobs": len(job_tracker.statuses),
+        "uptime": "OK"
+    }
+
+# Run server with graceful shutdown
+def run_app():
+    """Start the uvicorn server with the FastAPI app"""
+    uvicorn.run(
+        app, 
+        host=config.HOST, 
+        port=config.PORT,
+        log_level="info",
+        access_log=True
+    )
+
+# Server startup
+def start_server(use_ngrok=False):
+    """Start the FastAPI server"""
+    if use_ngrok:
+        # Start ngrok tunnel
+        try:
+            public_url = ngrok.connect(config.PORT)
+            logger.info(f"🚀 FastAPI server running at: {public_url}")
+        except Exception as e:
+            logger.error(f"Failed to start ngrok tunnel: {str(e)}")
+            logger.info(f"🚀 FastAPI server running at: http://{config.HOST}:{config.PORT}")
+    else:
+        logger.info(f"🚀 FastAPI server running at: http://{config.HOST}:{config.PORT}")
+    
+    # Start server in a safe way that can be interrupted
+    run_app()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="논문 요약기")
-    parser.add_argument("--file","-f", help="요약할 파일명")
-    parser.add_argument("--instruction", "-i", help="instruction 파일 경로")
-    parser.add_argument("--temperature", "-t", type=float, default=0.4, help="온도 설정")
-    args = parser.parse_args()
-    main(args)
+    start_server(use_ngrok=config.USE_NGROK)
