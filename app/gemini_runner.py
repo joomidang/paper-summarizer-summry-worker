@@ -210,13 +210,6 @@ def prompt2_section_summary_from_template(paper_md_content, classification, pape
     
     # 분류별 템플릿 정의
     common_sections_desc = """
-# 제목
-- author: [저자 정보 필요], # Placeholder
-- pub_date: "[출판 연도 필요]",   # Placeholder
-- journal: "[저널/출판사 필요]", # Placeholder
-- field: "[학문 분야 필요]",   # Placeholder
-- doi_link: "[DOI/링크 필요]"    # Placeholder
-
 **연구 동기 및 주요 기여 요약**
 - 문제 배경·연구 동기 (≥ 1 단락)
 - 핵심 기여·혁신점 (≥ 1 단락)
@@ -326,6 +319,13 @@ For EACH subheading, provide at least two detailed paragraphs. If the paper lack
     3.  Ensure there's a blank line between the header and your descriptive text.
 -   Do NOT include any self-meta commentary like "I will now summarize..." or "This section covers...". Directly provide the summary content under each heading.
 -   If `content_list_json` is provided, it contains a list of figures/tables with S3 URLs and captions. Prioritize using these if the Markdown itself is missing them, or to confirm details.
+- Include Metadata at the front of the summary:
+# 제목
+- **저자:**[저자 정보 필요], # Placeholder
+- **출판일:** "[출판 연도 필요]",   # Placeholder
+- **저널/출판사:**  "[저널/출판사 필요]", # Placeholder
+- **분야:**  "[학문 분야 필요]",   # Placeholder
+- **DOI/링크:** "[DOI/링크 필요]"    # Placeholder
 
 **Example of correct image insertion:**
 ```
