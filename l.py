@@ -12,17 +12,19 @@ import boto3
 import uvicorn
 import httpx
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, Body, Header, HTTPException, Depends, BackgroundTasks, status
+from fastapi import FastAPI, Body, Header, HTTPException, BackgroundTasks, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pyngrok import ngrok
 from functools import wraps
+from contextlib import asynccontextmanager
 
 # MagicPDF imports
 from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
 from magic_pdf.data.dataset import PymuDocDataset
 from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
 from magic_pdf.tools import counter_manager
+
 
 # Configure logging
 logging.basicConfig(
@@ -638,27 +640,8 @@ async def process_pdf_workflow(job_id: str, request: ParseRequest) -> None:
             message=f"Error: {str(e)}"
         )
 
-# Initialize FastAPI app
-app = FastAPI(title="MagicPDF Processing Service")
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Background task for periodic job cleanup
-@app.on_event("startup")
-async def setup_periodic_tasks():
-    """Set up periodic tasks to run on application startup"""
-    # Load saved job statuses if available
-    job_tracker.load_from_file()
-    
-    # Start periodic cleanup task
-    asyncio.create_task(periodic_cleanup())
+cleanup_task = None
 
 async def periodic_cleanup():
     """Periodically clean up old jobs to prevent memory leaks"""
@@ -671,18 +654,45 @@ async def periodic_cleanup():
             logger.error(f"Error in periodic cleanup: {str(e)}")
             await asyncio.sleep(300)  # If error, retry after 5 minutes
 
-@app.on_event("shutdown")
-async def save_state():
-    """Save state before shutting down"""
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global cleanup_task
+    job_tracker.load_from_file()
+    cleanup_task = asyncio.create_task(periodic_cleanup())
+    logger.info("Application startup completed")
+    
+    yield
+    
+    # Shutdown
+    if cleanup_task:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
     job_tracker.save_to_file()
     logger.info("Saved job statuses to file before shutdown")
+
+# Initialize FastAPI app with lifespan
+app = FastAPI(title="MagicPDF Processing Service", lifespan=lifespan)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # API endpoints
 @app.post("/api/parse", response_model=Response, status_code=status.HTTP_202_ACCEPTED)
 async def parse_paper(
     request: ParseRequest = Body(...),
     authorization: str = Header(None),
-    background_tasks: BackgroundTasks = Depends()
+    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     Parse a PDF paper and extract content
@@ -848,9 +858,9 @@ def run_app():
         access_log=True
     )
 
-# Server startup
-def start_server(use_ngrok=False):
-    """Start the FastAPI server"""
+# Server startup for Jupyter/notebook environments
+async def start_server_async(use_ngrok=False):
+    """Start the FastAPI server in async mode for Jupyter"""
     if use_ngrok:
         # Start ngrok tunnel
         try:
@@ -862,8 +872,57 @@ def start_server(use_ngrok=False):
     else:
         logger.info(f"🚀 FastAPI server running at: http://{config.HOST}:{config.PORT}")
     
-    # Start server in a safe way that can be interrupted
-    run_app()
+    # Create server config
+    config_obj = uvicorn.Config(
+        app=app,
+        host=config.HOST,
+        port=config.PORT,
+        log_level="info",
+        access_log=True
+    )
+    
+    # Start server
+    server = uvicorn.Server(config_obj)
+    await server.serve()
+
+# Server startup for regular Python environments
+
+# Server startup for regular Python environments
+# def start_server(use_ngrok=False):
+#     """Start the FastAPI server"""
+#     if use_ngrok:
+#         # Start ngrok tunnel
+#         try:
+#             public_url = ngrok.connect(config.PORT)
+#             logger.info(f"🚀 FastAPI server running at: {public_url}")
+#         except Exception as e:
+#             logger.error(f"Failed to start ngrok tunnel: {str(e)}")
+#             logger.info(f"🚀 FastAPI server running at: http://{config.HOST}:{config.PORT}")
+#     else:
+#         logger.info(f"🚀 FastAPI server running at: http://{config.HOST}:{config.PORT}")
+    
+#     # Start server in a safe way that can be interrupted
+#     run_app()
+
+# if __name__ == "__main__":
+#     # Check if we're in a Jupyter environment
+#     try:
+#         __IPYTHON__
+#         # We're in Jupyter, use async version
+#         import nest_asyncio
+#         nest_asyncio.apply()
+#         asyncio.run(start_server_async(use_ngrok=True))
+#     except NameError:
+#         # We're in regular Python, use sync version
+#         start_server(use_ngrok=True)
+
+
+def start_server():
+    nest_asyncio.apply()
+    public_url = ngrok.connect(8000)
+    print(f"🚀 FastAPI server running at: {public_url}")
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
-    start_server(use_ngrok=config.USE_NGROK)
+    start_server()
