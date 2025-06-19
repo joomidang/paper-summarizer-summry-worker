@@ -5,7 +5,7 @@ from app.config import settings
 
 client = genai.Client(api_key=settings.gemini_api_key)
 
-def run_gpt_summarization(instruction_path: str, markdown_text: str, content_list: object, prompt: str = "이 논문을 요약해줘", temperature=0.2) -> str:
+def run_gpt_summarization(instruction_path: str, markdown_text: str, content_list: object, prompt: str = "이 논문을 요약해줘", temperature=0.2, enable_hallucination_check=False) -> str:
     start_time = time.time()
     
     try:
@@ -14,7 +14,7 @@ def run_gpt_summarization(instruction_path: str, markdown_text: str, content_lis
         content_list_str = json.dumps(content_list, ensure_ascii=False) if isinstance(content_list, (dict, list)) else content_list
         
         # Run the multi-turn summarization process
-        summary = run_multi_turn_summarization(markdown_text, content_list_str, prompt, temperature)
+        summary = run_multi_turn_summarization(markdown_text, content_list_str, prompt, temperature, enable_hallucination_check)
         
         summary_length = len(summary)
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 요약 결과 추출 완료: {summary_length}자")
@@ -39,9 +39,12 @@ def call_gemini_model(system_instruction, user_content, temperature=0.0, model_n
         return response.text
     except Exception as e:
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Gemini API 오류: {e}")
+        # Fallback for safety, though specific error handling is better
+        if "block_reason: SAFETY" in str(e) or (hasattr(e, 'message') and "SAFETY" in str(e)):
+             return "Error: Content generation blocked due to safety concerns."
         raise e
 
-def run_multi_turn_summarization(paper_md_content, paper_json_content_str, prompt, temperature):
+def run_multi_turn_summarization(paper_md_content, paper_json_content_str, prompt, temperature, enable_hallucination_check=False):
 
     # 1단계: 논문 분류 및 키워드 추출
     prompt1_output = prompt1_classify_keywords_summary(paper_md_content)
@@ -92,9 +95,247 @@ def run_multi_turn_summarization(paper_md_content, paper_json_content_str, promp
     # Step 4: Final review and polish
     # summary = prompt4_final_review(final_markdown)
     
+    # Hallucination Check 
+    if enable_hallucination_check:
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 🔍 환각 검증 시작...")
+        hallucination_validation_results = comprehensive_hallucination_validation(
+            final_markdown, paper_md_content, max_iterations=3
+        )
+        
+        if hallucination_validation_results["validation_successful"]:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ✅ 환각 검증 통과")
+        else:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ⚠️ 환각 검증 실패 - 개선된 버전 사용")
+        
+        final_markdown = hallucination_validation_results["final_summary"]
+    
     # return summary
     return final_markdown
 
+# --- Hallucination Validation Functions ---
+
+def hallucination_step1_binary_check(summary, original_paper):
+    """1단계: 환각 여부 예/아니오 판단"""
+    system_instruction = """
+제공된 요약이 해당 기사와 일치하는지를 기준으로 '환각(hallucinated)'으로 분류될 수 있는지를 판단해 주세요. 
+여기서 '환각'이란, 언어적으로는 논리적이지만 원문에 언급되지 않았거나 사실과 다른 내용을 포함한 요약을 의미합니다.
+
+응답 형식: 예 또는 아니오
+"""
+    
+    user_content = f"""
+원문:
+{original_paper}
+
+요약:
+{summary}
+"""
+    
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]    환각 검증 1단계: 예/아니오 판단 중...")
+    response = call_gemini_model(system_instruction, user_content, temperature=0.0)
+    
+    # 응답 파싱
+    response_clean = response.strip().lower()
+    is_hallucinated = "예" in response_clean or "yes" in response_clean
+    
+    return {
+        "is_hallucinated": is_hallucinated,
+        "raw_response": response
+    }
+
+def hallucination_step2_detailed_analysis(summary, original_paper):
+    """2단계: 환각에 대한 상세 분석"""
+    system_instruction = """
+제공된 요약이 해당 기사와 일치하는지를 기준으로 '환각(hallucinated)'으로 분류될 수 있는지를 판단해 주세요. 
+여기서 '환각'이란, 언어적으로는 논리적이지만 원문에 언급되지 않았거나 사실과 다른 내용을 포함한 요약을 의미합니다.
+
+응답 형식: 단계별로 논리를 설명한 후, 예 또는 아니오로 대답
+"""
+    
+    user_content = f"""
+원문:
+{original_paper}
+
+요약:
+{summary}
+"""
+    
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]    환각 검증 2단계: 상세 분석 중...")
+    response = call_gemini_model(system_instruction, user_content, temperature=0.0)
+    
+    # 최종 판단 추출
+    lines = response.strip().split('\n')
+    final_answer = None
+    for line in reversed(lines):
+        line_clean = line.strip().lower()
+        if "예" in line_clean and "아니오" not in line_clean:
+            final_answer = "예"
+            break
+        elif "아니오" in line_clean and "예" not in line_clean:
+            final_answer = "아니오"
+            break
+    
+    return {
+        "detailed_analysis": response,
+        "final_judgment": final_answer,
+        "is_hallucinated": final_answer == "예"
+    }
+
+def hallucination_step3_score_evaluation(summary, original_paper):
+    """3단계: 환각 수준 1-10점 평가"""
+    system_instruction = """
+다음 요약을 해당 기사와 비교하여 '환각'의 관점에서 1점에서 10점 사이로 평가해 주세요. 
+여기서 '환각'이란, 언어적으로는 논리적이지만 원문에 언급되지 않았거나 사실과 다른 내용을 포함한 요약을 의미합니다. 
+10점은 전혀 환각되지 않은 요약을, 1점은 완전히 환각된 요약을 의미합니다.
+
+응답 형식: 점수 (1-10)
+"""
+    
+    user_content = f"""
+원문:
+{original_paper}
+
+요약:
+{summary}
+"""
+    
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]    환각 검증 3단계: 점수 평가 중...")
+    response = call_gemini_model(system_instruction, user_content, temperature=0.0)
+    
+    # 점수 추출
+    score_match = re.search(r'(\d+)', response.strip())
+    score = int(score_match.group(1)) if score_match else 5
+    score = max(1, min(10, score))  # 1-10 범위로 제한
+    
+    return {
+        "hallucination_score": score,
+        "raw_response": response
+    }
+
+def hallucination_step4_refine_summary(summary, original_paper, hallucination_issues=None):
+    """4단계: 환각 제거를 위한 요약 정제"""
+    system_instruction = """
+요약을 정제하고 '환각'을 줄여서 각 요약이 10점 만점을 받을 수 있도록 개선해 주세요. 
+여기서 '환각'이란, 언어적으로는 논리적이지만 원문에 언급되지 않았거나 사실과 다른 내용을 포함한 요약을 의미합니다.
+
+**중요한 이미지 형식 규칙:**
+- 모든 <img> 태그를 정확히 그대로 유지하세요
+- 이미지를 독립적인 요소로 유지하고 앞뒤에 빈 줄을 유지하세요
+
+지침:
+1. 원문에 명시되지 않은 내용은 제거하거나 수정하세요
+2. 추론이나 해석은 명확히 구분하여 표현하세요
+3. 원문의 정확한 정보만을 포함하세요
+4. 기존 요약의 구조와 형식은 최대한 유지하세요
+
+응답 형식: 정제된 요약문
+"""
+    
+    additional_context = ""
+    if hallucination_issues:
+        additional_context = f"\n\n발견된 환각 문제점:\n{hallucination_issues}"
+    
+    user_content = f"""
+원문:
+{original_paper}
+
+개선할 요약:
+{summary}{additional_context}
+"""
+    
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]    환각 검증 4단계: 요약 정제 중...")
+    refined_summary = call_gemini_model(system_instruction, user_content, temperature=0.1)
+    
+    return refined_summary
+
+def hallucination_step5_final_verification(refined_summary, original_paper):
+    """5단계: 정제된 요약에 대한 최종 검증"""
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]    환각 검증 5단계: 최종 검증 중...")
+    
+    # 1단계 재실행
+    binary_result = hallucination_step1_binary_check(refined_summary, original_paper)
+    
+    # 3단계 재실행
+    score_result = hallucination_step3_score_evaluation(refined_summary, original_paper)
+    
+    return {
+        "final_binary_check": binary_result,
+        "final_score": score_result,
+        "improvement_verified": not binary_result["is_hallucinated"] and score_result["hallucination_score"] >= 8
+    }
+
+def comprehensive_hallucination_validation(summary, original_paper, max_iterations=3):
+    """종합적인 환각 검증 프로세스"""
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] === 환각 검증 프로세스 시작 ===")
+    
+    validation_results = {
+        "iterations": [],
+        "final_summary": summary,
+        "validation_successful": False
+    }
+    
+    current_summary = summary
+    
+    for iteration in range(max_iterations):
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] --- 반복 {iteration + 1} ---")
+        
+        iteration_result = {
+            "iteration_number": iteration + 1,
+            "input_summary": current_summary
+        }
+        
+        # 1단계: 예/아니오 판단
+        step1_result = hallucination_step1_binary_check(current_summary, original_paper)
+        iteration_result["step1_binary"] = step1_result
+        
+        # 2단계: 상세 분석
+        step2_result = hallucination_step2_detailed_analysis(current_summary, original_paper)
+        iteration_result["step2_detailed"] = step2_result
+        
+        # 3단계: 점수 평가
+        step3_result = hallucination_step3_score_evaluation(current_summary, original_paper)
+        iteration_result["step3_score"] = step3_result
+        
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]    환각 점수: {step3_result['hallucination_score']}/10")
+        
+        # 점수가 8점 이상이고 환각이 없다고 판단되면 종료
+        if step3_result['hallucination_score'] >= 8 and not step1_result['is_hallucinated']:
+            print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]    환각 검증 통과!")
+            iteration_result["refinement_needed"] = False
+            validation_results["validation_successful"] = True
+            validation_results["iterations"].append(iteration_result)
+            break
+        
+        # 4단계: 요약 정제
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}]    환각 감소를 위한 정제 필요")
+        iteration_result["refinement_needed"] = True
+        
+        hallucination_issues = step2_result.get("detailed_analysis", "")
+        refined_summary = hallucination_step4_refine_summary(
+            current_summary, 
+            original_paper, 
+            hallucination_issues
+        )
+        
+        iteration_result["step4_refined"] = refined_summary
+        current_summary = refined_summary
+        
+        validation_results["iterations"].append(iteration_result)
+    
+    # 5단계: 최종 검증
+    if validation_results["iterations"]:
+        final_verification = hallucination_step5_final_verification(current_summary, original_paper)
+        validation_results["final_verification"] = final_verification
+        validation_results["validation_successful"] = final_verification["improvement_verified"]
+    
+    validation_results["final_summary"] = current_summary
+    
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] === 환각 검증 완료 ===")
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 최종 성공 여부: {validation_results['validation_successful']}")
+    
+    return validation_results
+
+# --- Original Prompt Functions (기존 함수들 유지) ---
 
 def prompt1_classify_keywords_summary(paper_md_content):
     """Classifies paper and extracts keywords"""
@@ -420,12 +661,12 @@ Your tasks are:
 Strictly adhere to the following final Markdown output format. Do not add any extra explanations before or after the formatted output.
 
 
-# {paper_metadata['paper_title']}
-**저자:** {paper_metadata['author']}
-**출판일:** {paper_metadata['pub_date']}
-**저널/출판사:** {paper_metadata['journal']}
-**분야:** {paper_metadata['field']}
-**DOI/링크:** {paper_metadata['doi_link']}
+# [논문 제목]
+**저자:** [이름]  
+**출판일:** [연도]  
+**저널/출판사:** [이름]  
+**분야:** [학문 분야]  
+**DOI/링크:** [URL]
 
 ## 주제 유형: **{classification}**
 
@@ -475,22 +716,8 @@ def prompt4_final_review(final_summary):
 
 모든 내용을 유지하면서 명확성과 흐름을 개선한 최종 완성 버전을 제공하세요.
 모든 <img> 태그는 입력된 그대로 정확히 유지해야 합니다.
-자기 메타 설명(“~을 하겠습니다”)과 진행 보고는 절대 포함하지 않습니다.
+자기 메타 설명("~을 하겠습니다")과 진행 보고는 절대 포함하지 않습니다.
 """
     
     print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ✨ 4단계: 최종 검토 및 다듬기 중...")
     return call_gemini_model(system_instruction, final_summary, temperature=0.1)
-
-
-
-
-
-
-
-
-
-
-
-
-
-

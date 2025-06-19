@@ -26,7 +26,8 @@ def on_message(ch, method, properties, body):
             markdown_text=markdown_text,
             content_list=content_list_json,
             prompt=prompt,
-            temperature=temperature
+            temperature=temperature,
+            enable_hallucination_check=True
         )
         s3_key = upload_markdown(summary, paper_id)
         publish_summary_completed(paper_id, s3_key)
